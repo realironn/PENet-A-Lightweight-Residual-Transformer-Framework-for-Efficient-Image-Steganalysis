@@ -1,4 +1,4 @@
-PENet Steganalysis (Alaska2 QF90)
+PENet+ Steganalysis (Alaska2 QF90)
 ==================================
 
 Lightweight snapshot of the PENet steganalysis code focused on the arbitrary-size model `PENet_Arbitrary_layer_pdc_newHPFv3_DepthMHSA_chooseAct_All_cos.py`.
