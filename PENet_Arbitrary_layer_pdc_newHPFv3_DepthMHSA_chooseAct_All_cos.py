@@ -539,23 +539,6 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-
-def pairwise_logistic_loss(logits: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
-    """
-    logits: (N,2)  # 클래스= {cover(0), stego(1)} 의 로짓
-    미니배치가 (B,2,…)에서 평탄화되어 N=2B 라고 가정 (cover가 앞, stego가 뒤)
-    stego-클래스의 logit 차이를 크게 만드는 로스: log(1 + exp(-(s_stego - s_cover - m)))
-    """
-    N, C = logits.shape
-    assert C == 2 and N % 2 == 0, "pairwise를 쓰려면 (cover,stego) 쌍 배치가 필요합니다."
-    B = N // 2
-    logits_pair = logits.view(B, 2, 2)           # [B, pair, class]
-    s_stego = logits_pair[:, 1, 1]               # stego 샘플의 'stego' 로짓
-    s_cover = logits_pair[:, 0, 1]               # cover 샘플의 'stego' 로짓
-    diff = s_stego - s_cover - margin
-    return F.softplus(-diff).mean()              # = log(1 + exp(-diff))
-
-
 def train(model, device, train_loader, optimizer, epoch, args=None, scheduler=None):
     batch_time = AverageMeter()
     data_time  = AverageMeter()
@@ -583,18 +566,7 @@ def train(model, device, train_loader, optimizer, epoch, args=None, scheduler=No
         # --- CE term ---
         ce_term = F.cross_entropy(logits, label, reduction='mean')
 
-        # --- Pairwise term (cover/stego 쌍 전제) ---
-        pair_term = pairwise_logistic_loss(logits, margin=args.pair_margin)
-
-        # --- 가중치 (Pairwise는 선형 웜업) ---
-        if args is not None:
-            ramp   = 1.0 if args.pair_warmup <= 0 else min(1.0, max(0.0, (epoch - 1) / args.pair_warmup))
-            pair_w = args.pair_lambda * ramp
-            ce_w   = getattr(args, 'ce_weight', 1.0)
-        else:
-            pair_w, ce_w = 0.5, 1.0
-
-        loss = ce_w * ce_term + pair_w * pair_term
+        loss = ce_term
 
         # backward
         losses.update(loss.item(), data.size(0))
@@ -615,7 +587,7 @@ def train(model, device, train_loader, optimizer, epoch, args=None, scheduler=No
                 f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                 f'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                 f'Loss {losses.val:.4f} ({losses.avg:.4f})\t'
-                f'CE {ce_term.item():.4f} | Pair(w={pair_w:.2f}) {pair_term.item():.4f}'
+                f'CE {ce_term.item():.4f}'
             )
 
 
@@ -693,6 +665,7 @@ def initWeights(module, nonlinearity='relu', a=0.0): # 신경망의 가중치 �
 class AugData():
     def __call__(self, sample):
         data, label = sample['data'], sample['label']
+        name = sample.get('name') if isinstance(sample, dict) else None
 
         rot = random.randint(0, 3)
 
@@ -702,6 +675,8 @@ class AugData():
             data = np.flip(data, axis=2).copy()
 
         new_sample = {'data': data, 'label': label}
+        if name is not None:
+            new_sample['name'] = name
 
         return new_sample
 
@@ -709,6 +684,7 @@ class AugData():
 class ToTensor():
     def __call__(self, sample):
         data, label = sample['data'], sample['label']
+        name = sample.get('name') if isinstance(sample, dict) else None
 
         data = data.astype(np.float32)
 
@@ -716,6 +692,8 @@ class ToTensor():
             'data': torch.from_numpy(data),
             'label': torch.from_numpy(label).long(),
         }
+        if name is not None:
+            new_sample['name'] = name
 
         return new_sample
 
@@ -751,7 +729,7 @@ class MyDataset(Dataset):
         data = np.stack([cover_data, stego_data])
         label = np.array([0, 1], dtype='int32')
 
-        sample = {'data': data, 'label': label}
+        sample = {'data': data, 'label': label, 'name': file_index}
 
         if self.transform:
             sample = self.transform(sample)
@@ -798,7 +776,7 @@ def main(args):
     TIMES = args.times
 
     COVER_DIR = r'Alaska2/QF_90/cover'
-    STEGO_DIR = r'Alaska2/QF_90/Stego/conseal_UERD_0.4'
+    STEGO_DIR = r'Alaska2/QF_90/Stego/conseal_nsF5_0.4'
 
     TEST_COVER = COVER_DIR
     TEST_STEGO  = STEGO_DIR
@@ -839,8 +817,14 @@ def main(args):
 
     # print("[HPF] measuring mean energy over train set...")
     # fixed_indices = select_fixed_indices(loader=measure_loader, device=device, bank_size=args.hpf_bank, total_k=args.hpf_topk, gabor_k=None)
-    print("[HPF] learning gate to select top-K filters...")
-    fixed_indices = learnable_select_indices(loader=measure_loader, device=device, bank_size=args.hpf_bank, top_k=args.hpf_topk, epochs=args.hpf_learn_epochs, gabor_k=args.hpf_gabor)
+    if args.hpf_mode == 'random':
+        k = args.hpf_random_topk if args.hpf_random_topk is not None else args.hpf_topk
+        k = max(0, min(k, args.hpf_bank))
+        fixed_indices = random.sample(range(args.hpf_bank), k)
+        print(f"[HPF] randomly picked {k} filters out of {args.hpf_bank}: {fixed_indices}")
+    else:
+        print("[HPF] learning gate to select top-K filters...")
+        fixed_indices = learnable_select_indices(loader=measure_loader, device=device, bank_size=args.hpf_bank, top_k=args.hpf_topk, epochs=args.hpf_learn_epochs, gabor_k=args.hpf_gabor)
     k_fixed = len(fixed_indices)
     print(f"[HPF] fixed K = {k_fixed}  indices = {fixed_indices}")
 
@@ -866,7 +850,7 @@ def main(args):
 
     # (2) 어텐션 모듈만 따로
     attn = model.module.entrans
-    dummy_attn = torch.randn(1, 32, 64, 64).to(device) # (B, C, H, W) = EnhanceMHSA 입력 크기
+    dummy_attn = torch.randn(1, 128, 64, 64).to(device) # (B, C, H, W) = EnhanceMHSA 입력 크기
     flops_attn = FlopCountAnalysis(attn, (dummy_attn,)).total()
 
     # (3) 실제 벤치마크 GFLOPS
@@ -1079,10 +1063,25 @@ def myParseArgs():
     # ── HPF 선택 ──
     # myParseArgs() 안에 추가
     parser.add_argument(
+        '--hpf-mode',
+        type=str,
+        default='learn',
+        choices=['learn', 'random'],
+        help='HPF selection strategy: learn = gate-based top-K, random = sample filters without gate training'
+    )
+
+    parser.add_argument(
         '--hpf-topk', 
         type=int, 
         default=31,
         help='use fixed HPF numbers'
+    )
+
+    parser.add_argument(
+        '--hpf-random-topk',
+        type=int,
+        default=None,
+        help='when --hpf-mode=random, sample this many filters (defaults to hpf-topk if not set)'
     )
     
     parser.add_argument(
@@ -1103,35 +1102,6 @@ def myParseArgs():
         '--hpf-learn-epochs', 
         type=int, 
         default=3
-    )
-
-    # ── Pairwise loss ──
-    parser.add_argument(
-        '--pair-lambda', 
-        type=float, 
-        default=0.7,
-        help='weight for pairwise logistic loss'
-    )
-    
-    parser.add_argument(
-        '--pair-margin', 
-        type=float, 
-        default=0.1,
-        help='margin m in pairwise logistic: log(1+exp(-(Δ-m)))'
-    )
-
-    parser.add_argument(
-        '--pair-warmup', 
-        type=int, 
-        default=5,
-        help='epochs to linearly ramp pair-lambda from 0→target'
-    )
-
-    parser.add_argument(
-        '--ce-weight', 
-        type=float, 
-        default=1.0,
-        help='weight for CE term; set 0.0 to use pairwise-only'
     )
 
     # 옵티마이저 옵션들 다음에 추가
